@@ -92,7 +92,7 @@ include(SwiftSupport)
 # NOTE(abdulras) this is the CMake supported way to control whether we generate
 # shared or static libraries.  This impacts the behaviour of `add_library` in
 # what type of library it generates.
-option(BUILD_SHARED_LIBS "build shared libraries" ON)
+option(BUILD_SHARED_LIBS "build shared libraries" OFF)
 
 option(DISPATCH_ENABLE_ASSERTS "enable debug assertions" FALSE)
 
