@@ -47,7 +47,7 @@ set(USE_LIBDISPATCH_INIT_CONSTRUCTOR ${ENABLE_DISPATCH_INIT_CONSTRUCTOR})
 # NOTE(abdulras) this is the CMake supported way to control whether we generate
 # shared or static libraries.  This impacts the behaviour of `add_library` in
 # what type of library it generates.
-option(BUILD_SHARED_LIBS "build shared libraries" ON)
+option(BUILD_SHARED_LIBS "build shared libraries" OFF)
 
 option(ENABLE_SWIFT "enable libdispatch swift overlay" OFF)
 if(ENABLE_SWIFT)
