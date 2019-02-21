@@ -47,7 +47,7 @@ set(USE_LIBDISPATCH_INIT_CONSTRUCTOR ${ENABLE_DISPATCH_INIT_CONSTRUCTOR})
 # NOTE(abdulras) this is the CMake supported way to control whether we generate
 # shared or static libraries.  This impacts the behaviour of `add_library` in
 # what type of library it generates.
-option(BUILD_SHARED_LIBS "build shared libraries" ON)
+option(BUILD_SHARED_LIBS "build shared libraries" OFF)
 
 option(ENABLE_SWIFT "enable libdispatch swift overlay" OFF)
 if(ENABLE_SWIFT)
@@ -198,7 +198,8 @@ check_function_exists(strlcpy HAVE_STRLCPY)
 check_function_exists(sysconf HAVE_SYSCONF)
 check_function_exists(arc4random HAVE_ARC4RANDOM)
 
-if(NOT HAVE_STRLCPY AND NOT HAVE_GETPROGNAME)
+option(DISABLE_LIBBSD "DISABLE_LIBBSD" OFF)
+if(NOT HAVE_STRLCPY AND NOT HAVE_GETPROGNAME AND NOT DISABLE_LIBBSD)
   include(FindPkgConfig)
   pkg_check_modules(BSD_OVERLAY libbsd-overlay)
   if(BSD_OVERLAY_FOUND)
