@@ -62,6 +62,7 @@
 
 #include <dispatch/benchmark.h>
 #include <dispatch/queue_private.h>
+#include <dispatch/workloop_private.h>
 #include <dispatch/source_private.h>
 #if DISPATCH_MACH_SPI
 #include <dispatch/mach_private.h>
@@ -69,13 +70,13 @@
 #include <dispatch/data_private.h>
 #include <dispatch/io_private.h>
 #include <dispatch/layout_private.h>
+#include <dispatch/time_private.h>
 
 #undef __DISPATCH_INDIRECT__
-
 #endif /* !__DISPATCH_BUILDING_DISPATCH__ */
 
 // <rdar://problem/9627726> Check that public and private dispatch headers match
-#if DISPATCH_API_VERSION != 20170124 // Keep in sync with <dispatch/dispatch.h>
+#if DISPATCH_API_VERSION != 20180109 // Keep in sync with <dispatch/dispatch.h>
 #error "Dispatch header mismatch between /usr/include and /usr/local/include"
 #endif
 
@@ -176,13 +177,13 @@ void _dispatch_prohibit_transition_to_multithreaded(bool prohibit);
 
 #if TARGET_OS_MAC
 #define DISPATCH_COCOA_COMPAT 1
-#elif defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(_WIN32)
 #define DISPATCH_COCOA_COMPAT 1
 #else
 #define DISPATCH_COCOA_COMPAT 0
 #endif
 
-#if DISPATCH_COCOA_COMPAT || defined(_WIN32)
+#if DISPATCH_COCOA_COMPAT
 
 #define DISPATCH_CF_SPI_VERSION 20160712
 
@@ -196,12 +197,10 @@ typedef void *dispatch_runloop_handle_t;
 #error "runloop support not implemented on this platform"
 #endif
 
-#if TARGET_OS_MAC
 API_AVAILABLE(macos(10.6), ios(4.0))
 DISPATCH_EXPORT DISPATCH_CONST DISPATCH_WARN_RESULT DISPATCH_NOTHROW
 dispatch_runloop_handle_t
 _dispatch_get_main_queue_port_4CF(void);
-#endif
 
 API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0))
 DISPATCH_EXPORT DISPATCH_NOTHROW
@@ -216,27 +215,20 @@ _dispatch_main_queue_callback_4CF(void *_Null_unspecified msg);
 API_AVAILABLE(macos(10.9), ios(7.0))
 DISPATCH_EXPORT DISPATCH_MALLOC DISPATCH_RETURNS_RETAINED DISPATCH_WARN_RESULT
 DISPATCH_NOTHROW
-dispatch_queue_t
+dispatch_queue_serial_t
 _dispatch_runloop_root_queue_create_4CF(const char *_Nullable label,
 		unsigned long flags);
 
-#if TARGET_OS_MAC || defined(_WIN32)
 API_AVAILABLE(macos(10.9), ios(7.0))
 DISPATCH_EXPORT DISPATCH_WARN_RESULT DISPATCH_NOTHROW
 dispatch_runloop_handle_t
 _dispatch_runloop_root_queue_get_port_4CF(dispatch_queue_t queue);
-#endif
 
 #if TARGET_OS_MAC
-#ifdef __BLOCKS__
-API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0))
-DISPATCH_EXPORT DISPATCH_MALLOC DISPATCH_RETURNS_RETAINED DISPATCH_WARN_RESULT
-DISPATCH_NOTHROW
-dispatch_queue_t
-_dispatch_network_root_queue_create_4NW(const char *_Nullable label,
-		const pthread_attr_t *_Nullable attrs,
-		dispatch_block_t _Nullable configure);
-#endif
+API_AVAILABLE(macos(10.13.2), ios(11.2), tvos(11.2), watchos(4.2))
+DISPATCH_EXPORT DISPATCH_WARN_RESULT DISPATCH_NOTHROW
+bool
+_dispatch_source_will_reenable_kevent_4NW(dispatch_source_t source);
 #endif
 
 API_AVAILABLE(macos(10.9), ios(7.0))
@@ -263,9 +255,9 @@ API_AVAILABLE(macos(10.6), ios(4.0))
 DISPATCH_EXPORT
 void (*_Nullable _dispatch_end_NSAutoReleasePool)(void *);
 
-#endif /* DISPATCH_COCOA_COMPAT || defined(_WIN32) */
+#endif /* DISPATCH_COCOA_COMPAT */
 
-API_AVAILABLE(macos(10.12), ios(10.0), tvos(10.0), watchos(3.0))
+API_AVAILABLE(macos(10.13), ios(11.0), tvos(11.0), watchos(4.0))
 DISPATCH_EXPORT DISPATCH_NOTHROW
 void
 _dispatch_poll_for_events_4launchd(void);

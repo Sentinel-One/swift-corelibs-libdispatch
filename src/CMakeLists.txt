@@ -1,3 +1,4 @@
+include(CheckCCompilerFlag)
 
 include(SwiftSupport)
 include(DTrace)
@@ -53,6 +54,7 @@ add_library(dispatch
               shims/perfmon.h
               shims/time.h
               shims/tsd.h
+              shims/yield.c
               shims/yield.h)
 
 set_target_properties(dispatch
@@ -63,6 +65,7 @@ if(WIN32)
   target_sources(dispatch
                  PRIVATE
                    shims/generic_sys_queue.h
+                   shims/generic_win_stubs.c
                    shims/generic_win_stubs.h
                    shims/getprogname.c)
 endif()
@@ -114,9 +117,17 @@ if(ENABLE_SWIFT)
                           POSITION_INDEPENDENT_CODE YES)
 
   if(USE_LLD_LINKER)
-    set(use_ld_flag -use-ld=lld)
+    if(CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
+      set(use_ld_flag -use-ld=lld.exe)
+    else()
+      set(use_ld_flag -use-ld=lld)
+    endif()
   elseif(USE_GOLD_LINKER)
-    set(use_ld_flag -use-ld=gold)
+    if(CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
+      set(use_ld_flag -use-ld=gold.exe)
+    else()
+      set(use_ld_flag -use-ld=gold)
+    endif()
   endif()
 
   add_swift_library(swiftDispatch
@@ -133,6 +144,8 @@ if(ENABLE_SWIFT)
                       -lBlocksRuntime
                       -L $<TARGET_LINKER_FILE_DIR:dispatch>
                       -ldispatch
+                      $<$<AND:$<PLATFORM_ID:Windows>,$<CONFIG:Debug>>:-lmsvcrtd>
+                      $<$<AND:$<PLATFORM_ID:Windows>,$<NOT:$<CONFIG:Debug>>>:-lmsvcrt>
                     MODULE_NAME
                       Dispatch
                     MODULE_LINK_NAME
@@ -152,8 +165,13 @@ if(ENABLE_SWIFT)
                     SWIFT_FLAGS
                       -I ${PROJECT_SOURCE_DIR}
                       ${swift_optimization_flags}
+                      $<$<PLATFORM_ID:Windows>:-Xcc>
+                      $<$<PLATFORM_ID:Windows>:-D_MT>
+                      # TODO(compnerd) handle /MT builds
+                      $<$<PLATFORM_ID:Windows>:-Xcc>
+                      $<$<PLATFORM_ID:Windows>:-D_DLL>
                     TARGET
-                      ${CMAKE_C_COMPILER_TARGET})
+                      ${CMAKE_SWIFT_COMPILER_TARGET})
 endif()
 if(ENABLE_DTRACE)
   dtrace_usdt_probe(${CMAKE_CURRENT_SOURCE_DIR}/provider.d
@@ -197,11 +215,6 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL Android)
                          PRIVATE
                            -U_GNU_SOURCE)
 endif()
-if(BSD_OVERLAY_FOUND)
-  target_compile_options(dispatch
-                         PRIVATE
-                           ${BSD_OVERLAY_CFLAGS})
-endif()
 if("${CMAKE_C_SIMULATE_ID}" STREQUAL "MSVC")
   target_compile_options(dispatch
                          PRIVATE
@@ -217,14 +230,11 @@ if("${CMAKE_C_SIMULATE_ID}" STREQUAL "MSVC")
                          PRIVATE
                            -Xclang -fblocks)
 else()
-  # FIXME(compnerd) add check for -momit-leaf-frame-pointer?
-  target_compile_options(dispatch
-                         PRIVATE
-                           -fblocks
-                           -momit-leaf-frame-pointer)
-endif()
-if(BSD_OVERLAY_FOUND)
-  target_link_libraries(dispatch PRIVATE ${BSD_OVERLAY_LDFLAGS})
+  check_c_compiler_flag("-momit-leaf-frame-pointer -Werror -Wall -O3" C_SUPPORTS_OMIT_LEAF_FRAME_POINTER)
+  target_compile_options(dispatch PRIVATE -fblocks)
+  if (C_SUPPORTS_OMIT_LEAF_FRAME_POINTER)
+    target_compile_options(dispatch PRIVATE -momit-leaf-frame-pointer)
+  endif()
 endif()
 if(LibRT_FOUND)
   target_link_libraries(dispatch PRIVATE RT::rt)
@@ -236,6 +246,7 @@ target_link_libraries(dispatch
 if(CMAKE_SYSTEM_NAME STREQUAL Windows)
   target_link_libraries(dispatch
                         PRIVATE
+                          ShLwApi
                           WS2_32
                           WinMM
                           synchronization)
@@ -269,19 +280,31 @@ if(ENABLE_SWIFT)
   else()
     set(library_kind STATIC)
   endif()
+
   set(swiftDispatch_OUTPUT_FILE
       ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_${library_kind}_LIBRARY_PREFIX}swiftDispatch${CMAKE_${library_kind}_LIBRARY_SUFFIX})
-  install(FILES
-            ${swiftDispatch_OUTPUT_FILE}
-          DESTINATION
-            ${INSTALL_TARGET_DIR})
-  if(CMAKE_SYSTEM_NAME STREQUAL Windows)
-    if(BUILD_SHARED_LIBS)
-      install(FILES
-                ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_IMPORT_LIBRARY_PREFIX}swiftDispatch${CMAKE_IMPORT_LIBRARY_SUFFIX}
-              DESTINATION
-                ${INSTALL_TARGET_DIR})
-    endif()
+
+  if(CMAKE_SYSTEM_NAME STREQUAL Windows AND BUILD_SHARED_LIBS)
+    install(FILES
+              ${swiftDispatch_OUTPUT_FILE}
+            DESTINATION
+              bin)
+    install(FILES
+              ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_IMPORT_LIBRARY_PREFIX}swiftDispatch${CMAKE_IMPORT_LIBRARY_SUFFIX}
+            DESTINATION
+              ${INSTALL_TARGET_DIR})
+  else()
+    install(FILES
+              ${swiftDispatch_OUTPUT_FILE}
+            DESTINATION
+              ${INSTALL_TARGET_DIR})
+  endif()
+
+  if(NOT BUILD_SHARED_LIBS)
+    install(FILES
+              $<TARGET_FILE:DispatchStubs>
+            DESTINATION
+              ${INSTALL_TARGET_DIR})
   endif()
 endif()
 

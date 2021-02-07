@@ -58,6 +58,12 @@ typedef struct { void *a; void *b; } dispatch_tsd_pair_t;
 #endif // _os_tsd_get_base
 #endif
 
+#if defined(_WIN32)
+#define DISPATCH_TSD_DTOR_CC __stdcall
+#else
+#define DISPATCH_TSD_DTOR_CC
+#endif
+
 #if DISPATCH_USE_DIRECT_TSD
 #ifndef __TSD_THREAD_QOS_CLASS
 #define __TSD_THREAD_QOS_CLASS 4
@@ -101,18 +107,13 @@ _dispatch_thread_key_create(const unsigned long *k, void (*d)(void *))
 #elif DISPATCH_USE_THREAD_LOCAL_STORAGE
 
 #if defined(_WIN32)
-#define DISPATCH_TSD_DTOR_CC __stdcall
-#else
-#define DISPATCH_TSD_DTOR_CC
-#endif
-
-#if defined(_WIN32)
 
 DISPATCH_TSD_INLINE
 static inline void
 _dispatch_thread_key_create(DWORD *k, void (DISPATCH_TSD_DTOR_CC *d)(void *))
 {
-	dispatch_assert_zero((*k = FlsAlloc(d)));
+	*k = FlsAlloc(d);
+	dispatch_assert(*k != FLS_OUT_OF_INDEXES);
 }
 
 extern DWORD __dispatch_tsd_key;
@@ -226,7 +227,7 @@ _dispatch_thread_setspecific(pthread_key_t k, void *v)
 	if (_pthread_has_direct_tsd()) {
 		(void)_pthread_setspecific_direct(k, v);
 	} else {
-#if TARGET_IPHONE_SIMULATOR
+#if TARGET_OS_SIMULATOR
 		(void)_pthread_setspecific_static(k, v); // rdar://26058142
 #else
 		__builtin_trap(); // unreachable

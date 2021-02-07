@@ -41,7 +41,7 @@ _dispatch_benchmark_init(void *context)
 	register size_t cnt = bdata->count;
 	size_t i = 0;
 	uint64_t start, delta;
-#if defined(__LP64__)
+#if DISPATCH_SIZEOF_PTR == 8 && !defined(_WIN32)
 	__uint128_t lcost;
 #else
 	long double lcost;
@@ -53,12 +53,12 @@ _dispatch_benchmark_init(void *context)
 	dispatch_assert_zero(kr);
 #endif
 
-	start = _dispatch_absolute_time();
+	start = _dispatch_uptime();
 	do {
 		i++;
 		f(c);
 	} while (i < cnt);
-	delta = _dispatch_absolute_time() - start;
+	delta = _dispatch_uptime() - start;
 
 	lcost = delta;
 #if HAVE_MACH_ABSOLUTE_TIME
@@ -93,7 +93,7 @@ dispatch_benchmark_f(size_t count, register void *ctxt,
 	};
 	static dispatch_once_t pred;
 	uint64_t ns, start, delta;
-#if defined(__LP64__)
+#if DISPATCH_SIZEOF_PTR == 8 && !defined(_WIN32)
 	__uint128_t conversion, big_denom;
 #else
 	long double conversion, big_denom;
@@ -102,16 +102,16 @@ dispatch_benchmark_f(size_t count, register void *ctxt,
 
 	dispatch_once_f(&pred, &bdata, _dispatch_benchmark_init);
 
-	if (slowpath(count == 0)) {
+	if (unlikely(count == 0)) {
 		return 0;
 	}
 
-	start = _dispatch_absolute_time();
+	start = _dispatch_uptime();
 	do {
 		i++;
 		func(ctxt);
 	} while (i < count);
-	delta = _dispatch_absolute_time() - start;
+	delta = _dispatch_uptime() - start;
 
 	conversion = delta;
 #if HAVE_MACH_ABSOLUTE_TIME

@@ -20,6 +20,11 @@
 
 #include "internal.h"
 
+#if defined(__FreeBSD__)
+#include <fcntl.h>
+#define F_RDADVISE F_RDAHEAD
+#endif
+
 #ifndef DISPATCH_IO_DEBUG
 #define DISPATCH_IO_DEBUG DISPATCH_DEBUG
 #endif
@@ -131,7 +136,7 @@ enum {
 #if DISPATCH_IO_DEBUG
 #if !DISPATCH_DEBUG
 #define _dispatch_io_log(x, ...) do { \
-			_dispatch_log("%llu\t%p\t" x, _dispatch_absolute_time(), \
+			_dispatch_log("%llu\t%p\t" x, _dispatch_uptime(), \
 			(void *)_dispatch_thread_self(), ##__VA_ARGS__); \
 		} while (0)
 #ifdef _dispatch_object_debug
@@ -147,7 +152,7 @@ enum {
 #endif // DISPATCH_IO_DEBUG
 
 #define _dispatch_fd_debug(msg, fd, ...) \
-		_dispatch_io_log("fd[0x%x]: " msg, fd, ##__VA_ARGS__)
+		_dispatch_io_log("fd[0x%" PRIx64 "]: " msg, fd, ##__VA_ARGS__)
 #define _dispatch_op_debug(msg, op, ...) \
 		_dispatch_io_log("op[%p]: " msg, op, ##__VA_ARGS__)
 #define _dispatch_channel_debug(msg, channel, ...) \
@@ -160,39 +165,28 @@ enum {
 #pragma mark -
 #pragma mark dispatch_io_hashtables
 
-// Global hashtable of dev_t -> disk_s mappings
-DISPATCH_CACHELINE_ALIGN
-static TAILQ_HEAD(, dispatch_disk_s) _dispatch_io_devs[DIO_HASH_SIZE];
-// Global hashtable of fd -> fd_entry_s mappings
-DISPATCH_CACHELINE_ALIGN
-static TAILQ_HEAD(, dispatch_fd_entry_s) _dispatch_io_fds[DIO_HASH_SIZE];
+LIST_HEAD(dispatch_disk_head_s, dispatch_disk_s);
+LIST_HEAD(dispatch_fd_entry_head_s, dispatch_fd_entry_s);
 
-static dispatch_once_t  _dispatch_io_devs_lockq_pred;
-static dispatch_queue_t _dispatch_io_devs_lockq;
-static dispatch_queue_t _dispatch_io_fds_lockq;
+// Global hashtable of dev_t -> disk_s mappings
+DISPATCH_STATIC_GLOBAL(struct dispatch_disk_head_s _dispatch_io_devs[DIO_HASH_SIZE]);
+DISPATCH_STATIC_GLOBAL(dispatch_queue_t _dispatch_io_devs_lockq);
+
+// Global hashtable of fd -> fd_entry_s mappings
+DISPATCH_STATIC_GLOBAL(struct dispatch_fd_entry_head_s _dispatch_io_fds[DIO_HASH_SIZE]);
+DISPATCH_STATIC_GLOBAL(dispatch_queue_t _dispatch_io_fds_lockq);
+
+DISPATCH_STATIC_GLOBAL(dispatch_once_t _dispatch_io_init_pred);
 
 static char const * const _dispatch_io_key = "io";
 
 static void
-_dispatch_io_fds_lockq_init(void *context DISPATCH_UNUSED)
+_dispatch_io_queues_init(void *context DISPATCH_UNUSED)
 {
 	_dispatch_io_fds_lockq = dispatch_queue_create(
 			"com.apple.libdispatch-io.fd_lockq", NULL);
-	unsigned int i;
-	for (i = 0; i < DIO_HASH_SIZE; i++) {
-		TAILQ_INIT(&_dispatch_io_fds[i]);
-	}
-}
-
-static void
-_dispatch_io_devs_lockq_init(void *context DISPATCH_UNUSED)
-{
 	_dispatch_io_devs_lockq = dispatch_queue_create(
 			"com.apple.libdispatch-io.dev_lockq", NULL);
-	unsigned int i;
-	for (i = 0; i < DIO_HASH_SIZE; i++) {
-		TAILQ_INIT(&_dispatch_io_devs[i]);
-	}
 }
 
 #pragma mark -
@@ -205,14 +199,16 @@ enum {
 	DISPATCH_IOCNTL_MAX_PENDING_IO_REQS,
 };
 
-static struct dispatch_io_defaults_s {
+extern struct dispatch_io_defaults_s {
 	size_t chunk_size, low_water_chunks, max_pending_io_reqs;
 	bool initial_delivery;
-} dispatch_io_defaults = {
+} dispatch_io_defaults;
+
+DISPATCH_GLOBAL_INIT(struct dispatch_io_defaults_s dispatch_io_defaults, {
 	.chunk_size = DIO_MAX_CHUNK_SIZE,
 	.low_water_chunks = DIO_DEFAULT_LOW_WATER_CHUNKS,
 	.max_pending_io_reqs = DIO_MAX_PENDING_IO_REQS,
-};
+});
 
 #define _dispatch_iocntl_set_default(p, v) do { \
 		dispatch_io_defaults.p = (__typeof__(dispatch_io_defaults.p))(v); \
@@ -230,6 +226,7 @@ _dispatch_iocntl(uint32_t param, uint64_t value)
 		break;
 	case DISPATCH_IOCNTL_INITIAL_DELIVERY:
 		_dispatch_iocntl_set_default(initial_delivery, value);
+		break;
 	case DISPATCH_IOCNTL_MAX_PENDING_IO_REQS:
 		_dispatch_iocntl_set_default(max_pending_io_reqs, value);
 		break;
@@ -245,7 +242,7 @@ _dispatch_io_create(dispatch_io_type_t type)
 	dispatch_io_t channel = _dispatch_object_alloc(DISPATCH_VTABLE(io),
 			sizeof(struct dispatch_io_s));
 	channel->do_next = DISPATCH_OBJECT_LISTLESS;
-	channel->do_targetq = _dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, true);
+	channel->do_targetq = _dispatch_get_default_queue(true);
 	channel->params.type = type;
 	channel->params.high = SIZE_MAX;
 	channel->params.low = dispatch_io_defaults.low_water_chunks *
@@ -409,15 +406,29 @@ dispatch_io_create_f(dispatch_io_type_t type, dispatch_fd_t fd,
 			^(int error){ cleanup_handler(context, error); });
 }
 
+#if defined(_WIN32)
+#define _is_separator(ch) ((ch) == '/' || (ch) == '\\')
+#else
+#define _is_separator(ch) ((ch) == '/')
+#endif
+
 dispatch_io_t
 dispatch_io_create_with_path(dispatch_io_type_t type, const char *path,
 		int oflag, mode_t mode, dispatch_queue_t queue,
 		void (^cleanup_handler)(int error))
 {
-	if ((type != DISPATCH_IO_STREAM && type != DISPATCH_IO_RANDOM) ||
-			!(*path == '/')) {
+	if (type != DISPATCH_IO_STREAM && type != DISPATCH_IO_RANDOM) {
 		return DISPATCH_BAD_INPUT;
 	}
+#if defined(_WIN32)
+	if (PathIsRelativeA(path)) {
+		return DISPATCH_BAD_INPUT;
+	}
+#else
+	if (!_is_separator(*path)) {
+		return DISPATCH_BAD_INPUT;
+	}
+#endif
 	size_t pathlen = strlen(path);
 	dispatch_io_path_data_t path_data = malloc(sizeof(*path_data) + pathlen+1);
 	if (!path_data) {
@@ -452,9 +463,15 @@ dispatch_io_create_with_path(dispatch_io_type_t type, const char *path,
 				break;
 			default:
 				if ((path_data->oflag & O_CREAT) &&
-						(*(path_data->path + path_data->pathlen - 1) != '/')) {
+						!_is_separator(*(path_data->path + path_data->pathlen - 1))) {
 					// Check parent directory
-					char *c = strrchr(path_data->path, '/');
+					char *c = NULL;
+					for (ssize_t i = (ssize_t)path_data->pathlen - 1; i >= 0; i--) {
+						if (_is_separator(path_data->path[i])) {
+							c = &path_data->path[i];
+							break;
+						}
+					}
 					dispatch_assert(c);
 					*c = 0;
 					int perr;
@@ -468,7 +485,11 @@ dispatch_io_create_with_path(dispatch_io_type_t type, const char *path,
 							err = 0;
 							break;
 					);
+#if defined(_WIN32)
+					*c = '\\';
+#else
 					*c = '/';
+#endif
 				}
 				break;
 		);
@@ -481,8 +502,8 @@ dispatch_io_create_with_path(dispatch_io_type_t type, const char *path,
 			return;
 		}
 		dispatch_suspend(channel->queue);
-		dispatch_once_f(&_dispatch_io_devs_lockq_pred, NULL,
-				_dispatch_io_devs_lockq_init);
+		dispatch_once_f(&_dispatch_io_init_pred, NULL,
+				_dispatch_io_queues_init);
 		dispatch_async(_dispatch_io_devs_lockq, ^{
 			dispatch_fd_entry_t fd_entry = _dispatch_fd_entry_create_with_path(
 					path_data, st.st_dev, st.st_mode);
@@ -733,7 +754,7 @@ _dispatch_io_stop(dispatch_io_t channel)
 							channel);
 					dispatch_fd_entry_t fdi;
 					uintptr_t hash = DIO_HASH(channel->fd);
-					TAILQ_FOREACH(fdi, &_dispatch_io_fds[hash], fd_list) {
+					LIST_FOREACH(fdi, &_dispatch_io_fds[hash], fd_list) {
 						if (fdi->fd == channel->fd) {
 							_dispatch_fd_entry_cleanup_operations(fdi, channel);
 							break;
@@ -928,7 +949,7 @@ dispatch_read(dispatch_fd_t fd, size_t length, dispatch_queue_t queue,
 		dispatch_operation_t op =
 			_dispatch_operation_create(DOP_DIR_READ, channel, 0,
 					length, dispatch_data_empty,
-					_dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, false),
+					_dispatch_get_default_queue(false),
 					^(bool done, dispatch_data_t data, int error) {
 				if (data) {
 					data = dispatch_data_create_concat(deliver_data, data);
@@ -999,7 +1020,7 @@ dispatch_write(dispatch_fd_t fd, dispatch_data_t data, dispatch_queue_t queue,
 		dispatch_operation_t op =
 			_dispatch_operation_create(DOP_DIR_WRITE, channel, 0,
 					dispatch_data_get_size(data), data,
-					_dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, false),
+					_dispatch_get_default_queue(false),
 					^(bool done, dispatch_data_t d, int error) {
 				if (done) {
 					if (d) {
@@ -1042,6 +1063,7 @@ _dispatch_operation_create(dispatch_op_direction_t direction,
 	if (err || !length) {
 		_dispatch_io_data_retain(data);
 		_dispatch_retain(queue);
+		_dispatch_retain(channel);
 		dispatch_async(channel->barrier_queue, ^{
 			dispatch_async(queue, ^{
 				dispatch_data_t d = data;
@@ -1053,6 +1075,7 @@ _dispatch_operation_create(dispatch_op_direction_t direction,
 				_dispatch_channel_debug("IO handler invoke: err %d", channel,
 						err);
 				handler(true, d, err);
+				_dispatch_release(channel);
 				_dispatch_io_data_release(data);
 			});
 			_dispatch_release(queue);
@@ -1077,7 +1100,7 @@ _dispatch_operation_create(dispatch_op_direction_t direction,
 	// Take a snapshot of the priority of the channel queue. The actual I/O
 	// for this operation will be performed at this priority
 	dispatch_queue_t targetq = op->channel->do_targetq;
-	while (fastpath(targetq->do_targetq)) {
+	while (targetq->do_targetq) {
 		targetq = targetq->do_targetq;
 	}
 	op->do_targetq = targetq;
@@ -1288,18 +1311,31 @@ _dispatch_fd_entry_guarded_open(dispatch_fd_entry_t fd_entry, const char *path,
 #if defined(_WIN32)
 	(void)mode;
 	DWORD dwDesiredAccess = 0;
-	if (oflag & _O_RDWR)
-		dwDesiredAccess = GENERIC_READ | GENERIC_WRITE;
-	else if (oflag & _O_RDONLY)
-		dwDesiredAccess = GENERIC_READ;
-	else if (oflag & _O_WRONLY)
-		dwDesiredAccess = GENERIC_WRITE;
+	switch (oflag & (_O_RDONLY | _O_WRONLY | _O_RDWR)) {
+		case _O_RDONLY:
+			dwDesiredAccess = GENERIC_READ;
+			break;
+		case _O_WRONLY:
+			dwDesiredAccess = GENERIC_WRITE;
+			break;
+		case _O_RDWR:
+			dwDesiredAccess = GENERIC_READ | GENERIC_WRITE;
+			break;
+	}
 	DWORD dwCreationDisposition = OPEN_EXISTING;
-	if (oflag & _O_CREAT)
+	if (oflag & _O_CREAT) {
 		dwCreationDisposition = OPEN_ALWAYS;
-	if (oflag & _O_TRUNC)
-		dwCreationDisposition = CREATE_ALWAYS;
-	return (dispatch_fd_t)CreateFile(path, dwDesiredAccess, 0, NULL, dwCreationDisposition, 0, NULL);
+		if (oflag & _O_EXCL) {
+			dwCreationDisposition = CREATE_NEW;
+		} else if (oflag & _O_TRUNC) {
+			dwCreationDisposition = CREATE_ALWAYS;
+		}
+	} else if (oflag & _O_TRUNC) {
+		dwCreationDisposition = TRUNCATE_EXISTING;
+	}
+	return (dispatch_fd_t)CreateFile(path, dwDesiredAccess,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+			dwCreationDisposition, 0, NULL);
 #else
 	return open(path, oflag, mode);
 #endif
@@ -1338,14 +1374,13 @@ static void
 _dispatch_fd_entry_init_async(dispatch_fd_t fd,
 		dispatch_fd_entry_init_callback_t completion_callback)
 {
-	static dispatch_once_t _dispatch_io_fds_lockq_pred;
-	dispatch_once_f(&_dispatch_io_fds_lockq_pred, NULL,
-			_dispatch_io_fds_lockq_init);
+	dispatch_once_f(&_dispatch_io_init_pred, NULL,
+			_dispatch_io_queues_init);
 	dispatch_async(_dispatch_io_fds_lockq, ^{
 		dispatch_fd_entry_t fd_entry = NULL;
 		// Check to see if there is an existing entry for the given fd
 		uintptr_t hash = DIO_HASH(fd);
-		TAILQ_FOREACH(fd_entry, &_dispatch_io_fds[hash], fd_list) {
+		LIST_FOREACH(fd_entry, &_dispatch_io_fds[hash], fd_list) {
 			if (fd_entry->fd == fd) {
 				// Retain the fd_entry to ensure it cannot go away until the
 				// stat() has completed
@@ -1387,9 +1422,9 @@ _dispatch_fd_entry_create_with_fd(dispatch_fd_t fd, uintptr_t hash)
 	// On fds lock queue
 	dispatch_fd_entry_t fd_entry = _dispatch_fd_entry_create(
 			_dispatch_io_fds_lockq);
-	_dispatch_fd_entry_debug("create: fd %d", fd_entry, fd);
+	_dispatch_fd_entry_debug("create: fd %" PRId64, fd_entry, fd);
 	fd_entry->fd = fd;
-	TAILQ_INSERT_TAIL(&_dispatch_io_fds[hash], fd_entry, fd_list);
+	LIST_INSERT_HEAD(&_dispatch_io_fds[hash], fd_entry, fd_list);
 	fd_entry->barrier_queue = dispatch_queue_create(
 			"com.apple.libdispatch-io.barrierq", NULL);
 	fd_entry->barrier_group = dispatch_group_create();
@@ -1401,11 +1436,11 @@ _dispatch_fd_entry_create_with_fd(dispatch_fd_t fd, uintptr_t hash)
 			int result = ioctlsocket((SOCKET)fd, (long)FIONBIO, &value);
 			(void)dispatch_assume_zero(result);
 			_dispatch_stream_init(fd_entry,
-				_dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, false));
+				_dispatch_get_default_queue(false));
 		} else {
 			dispatch_suspend(fd_entry->barrier_queue);
-			dispatch_once_f(&_dispatch_io_devs_lockq_pred, NULL,
-					_dispatch_io_devs_lockq_init);
+			dispatch_once_f(&_dispatch_io_init_pred, NULL,
+					_dispatch_io_queues_init);
 			dispatch_async(_dispatch_io_devs_lockq, ^{
 				_dispatch_disk_init(fd_entry, 0);
 				dispatch_resume(fd_entry->barrier_queue);
@@ -1457,8 +1492,8 @@ _dispatch_fd_entry_create_with_fd(dispatch_fd_t fd, uintptr_t hash)
 			// We have to get the disk on the global dev queue. The
 			// barrier queue cannot continue until that is complete
 			dispatch_suspend(fd_entry->barrier_queue);
-			dispatch_once_f(&_dispatch_io_devs_lockq_pred, NULL,
-					_dispatch_io_devs_lockq_init);
+			dispatch_once_f(&_dispatch_io_init_pred, NULL,
+					_dispatch_io_queues_init);
 			dispatch_async(_dispatch_io_devs_lockq, ^{
 				_dispatch_disk_init(fd_entry, dev);
 				dispatch_resume(fd_entry->barrier_queue);
@@ -1475,7 +1510,7 @@ _dispatch_fd_entry_create_with_fd(dispatch_fd_t fd, uintptr_t hash)
 			}
 
 			_dispatch_stream_init(fd_entry,
-					_dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, false));
+					_dispatch_get_default_queue(false));
 		}
 		fd_entry->orig_flags = orig_flags;
 		fd_entry->orig_nosigpipe = orig_nosigpipe;
@@ -1498,7 +1533,7 @@ _dispatch_fd_entry_create_with_fd(dispatch_fd_t fd, uintptr_t hash)
 			});
 		}
 		// Remove this entry from the global fd list
-		TAILQ_REMOVE(&_dispatch_io_fds[hash], fd_entry, fd_list);
+		LIST_REMOVE(fd_entry, fd_list);
 	});
 	// If there was a source associated with this stream, disposing of the
 	// source cancels it and suspends the close queue. Freeing the fd_entry
@@ -1550,7 +1585,7 @@ _dispatch_fd_entry_create_with_path(dispatch_io_path_data_t path_data,
 #endif
 	} else {
 			_dispatch_stream_init(fd_entry,
-					_dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, false));
+					_dispatch_get_default_queue(false));
 	}
 	fd_entry->fd = -1;
 	fd_entry->orig_flags = -1;
@@ -1713,7 +1748,7 @@ _dispatch_disk_init(dispatch_fd_entry_t fd_entry, dev_t dev)
 	dispatch_disk_t disk;
 	// Check to see if there is an existing entry for the given device
 	uintptr_t hash = DIO_HASH(dev);
-	TAILQ_FOREACH(disk, &_dispatch_io_devs[hash], disk_list) {
+	LIST_FOREACH(disk, &_dispatch_io_devs[hash], disk_list) {
 		if (disk->dev == dev) {
 			_dispatch_retain(disk);
 			goto out;
@@ -1727,7 +1762,7 @@ _dispatch_disk_init(dispatch_fd_entry_t fd_entry, dev_t dev)
 	disk->do_next = DISPATCH_OBJECT_LISTLESS;
 	disk->do_xref_cnt = -1;
 	disk->advise_list_depth = pending_reqs_depth;
-	disk->do_targetq = _dispatch_get_root_queue(DISPATCH_QOS_DEFAULT, false);
+	disk->do_targetq = _dispatch_get_default_queue(false);
 	disk->dev = dev;
 	TAILQ_INIT(&disk->operations);
 	disk->cur_rq = TAILQ_FIRST(&disk->operations);
@@ -1735,7 +1770,7 @@ _dispatch_disk_init(dispatch_fd_entry_t fd_entry, dev_t dev)
 	snprintf(label, sizeof(label), "com.apple.libdispatch-io.deviceq.%d",
 			(int)dev);
 	disk->pick_queue = dispatch_queue_create(label, NULL);
-	TAILQ_INSERT_TAIL(&_dispatch_io_devs[hash], disk, disk_list);
+	LIST_INSERT_HEAD(&_dispatch_io_devs[hash], disk, disk_list);
 out:
 	fd_entry->disk = disk;
 	TAILQ_INIT(&fd_entry->stream_ops);
@@ -1744,11 +1779,10 @@ out:
 void
 _dispatch_disk_dispose(dispatch_disk_t disk, DISPATCH_UNUSED bool *allow_free)
 {
-	uintptr_t hash = DIO_HASH(disk->dev);
-	TAILQ_REMOVE(&_dispatch_io_devs[hash], disk, disk_list);
+	LIST_REMOVE(disk, disk_list);
 	dispatch_assert(TAILQ_EMPTY(&disk->operations));
 	size_t i;
-	for (i=0; i<disk->advise_list_depth; ++i) {
+	for (i = 0; i < disk->advise_list_depth; ++i) {
 		dispatch_assert(!disk->advise_list[i]);
 	}
 	dispatch_release(disk->pick_queue);
@@ -2180,7 +2214,7 @@ _dispatch_disk_perform(void *ctxt)
 	op = disk->advise_list[disk->req_idx];
 	int result = _dispatch_operation_perform(op);
 	disk->advise_list[disk->req_idx] = NULL;
-	disk->req_idx = (++disk->req_idx)%disk->advise_list_depth;
+	disk->req_idx = (disk->req_idx + 1) % disk->advise_list_depth;
 	_dispatch_op_debug("async perform completion: disk %p", op, disk);
 	dispatch_async(disk->pick_queue, ^{
 		_dispatch_op_debug("perform completion", op);
@@ -2275,8 +2309,8 @@ _dispatch_operation_advise(dispatch_operation_t op, size_t chunk_size)
 	}
 #else
 #error "_dispatch_operation_advise not implemented on this platform"
-#endif
-#endif
+#endif // defined(F_RDADVISE)
+#endif // defined(_WIN32)
 }
 
 static int
@@ -2376,7 +2410,54 @@ syscall:
 	if (op->direction == DOP_DIR_READ) {
 		if (op->params.type == DISPATCH_IO_STREAM) {
 #if defined(_WIN32)
-			ReadFile((HANDLE)op->fd_entry->fd, buf, (DWORD)len, (LPDWORD)&processed, NULL);
+			HANDLE hFile = (HANDLE)op->fd_entry->fd;
+			BOOL bSuccess;
+			if (_dispatch_handle_is_socket(hFile)) {
+				processed = recv((SOCKET)hFile, buf, len, 0);
+				if (processed < 0) {
+					bSuccess = FALSE;
+					err = WSAGetLastError();
+					if (err == WSAEWOULDBLOCK) {
+						err = EAGAIN;
+					}
+					goto error;
+				}
+				bSuccess = TRUE;
+			} else if (GetFileType(hFile) == FILE_TYPE_PIPE) {
+				OVERLAPPED ovlOverlapped = {};
+				DWORD dwTotalBytesAvail;
+				bSuccess = PeekNamedPipe(hFile, NULL, 0, NULL,
+						&dwTotalBytesAvail, NULL);
+				if (bSuccess) {
+					if (dwTotalBytesAvail == 0) {
+						err = EAGAIN;
+						goto error;
+					}
+					len = MIN(len, dwTotalBytesAvail);
+					bSuccess = ReadFile(hFile, buf, (DWORD)len,
+							(LPDWORD)&processed, &ovlOverlapped);
+				}
+				if (!bSuccess) {
+					DWORD dwError = GetLastError();
+					if (dwError == ERROR_IO_PENDING) {
+						bSuccess = GetOverlappedResult(hFile, &ovlOverlapped,
+								(LPDWORD)&processed, /* bWait */ TRUE);
+						dwError = GetLastError();
+					}
+					if (dwError == ERROR_BROKEN_PIPE ||
+							dwError == ERROR_NO_DATA) {
+						bSuccess = TRUE;
+						processed = 0;
+					}
+				}
+			} else {
+				bSuccess = ReadFile(hFile, buf, (DWORD)len,
+						(LPDWORD)&processed, NULL);
+			}
+			if (!bSuccess) {
+				err = EIO;
+				goto error;
+			}
 #else
 			processed = read(op->fd_entry->fd, buf, len);
 #endif
@@ -2385,7 +2466,8 @@ syscall:
 			OVERLAPPED ovlOverlapped = {};
 			ovlOverlapped.Offset = off & 0xffffffff;
 			ovlOverlapped.OffsetHigh = (off >> 32) & 0xffffffff;
-			ReadFile((HANDLE)op->fd_entry->fd, buf, (DWORD)len, (LPDWORD)&processed, &ovlOverlapped);
+			ReadFile((HANDLE)op->fd_entry->fd, buf, (DWORD)len,
+					(LPDWORD)&processed, &ovlOverlapped);
 #else
 			processed = pread(op->fd_entry->fd, buf, len, off);
 #endif
@@ -2393,7 +2475,62 @@ syscall:
 	} else if (op->direction == DOP_DIR_WRITE) {
 		if (op->params.type == DISPATCH_IO_STREAM) {
 #if defined(_WIN32)
-			WriteFile((HANDLE)op->fd_entry->fd, buf, (DWORD)len, (LPDWORD)&processed, NULL);
+			HANDLE hFile = (HANDLE)op->fd_entry->fd;
+			BOOL bSuccess;
+			if (_dispatch_handle_is_socket(hFile)) {
+				processed = send((SOCKET)hFile, buf, len, 0);
+				if (processed < 0) {
+					bSuccess = FALSE;
+					err = WSAGetLastError();
+					if (err == WSAEWOULDBLOCK) {
+						err = EAGAIN;
+					}
+					goto error;
+				}
+				bSuccess = TRUE;
+			} else if (GetFileType(hFile) == FILE_TYPE_PIPE) {
+				// Unfortunately there isn't a good way to achieve O_NONBLOCK
+				// semantics when writing to a pipe. SetNamedPipeHandleState()
+				// can allow pipes to be switched into a "no wait" mode, but
+				// that doesn't work on most pipe handles because Windows
+				// doesn't consistently create pipes with FILE_WRITE_ATTRIBUTES
+				// access. The best we can do is to try to query the write quota
+				// and then write as much as we can.
+				IO_STATUS_BLOCK iosb;
+				FILE_PIPE_LOCAL_INFORMATION fpli;
+				NTSTATUS status = _dispatch_NtQueryInformationFile(hFile, &iosb,
+						&fpli, sizeof(fpli), FilePipeLocalInformation);
+				if (NT_SUCCESS(status)) {
+					if (fpli.WriteQuotaAvailable == 0) {
+						err = EAGAIN;
+						goto error;
+					}
+					len = MIN(len, fpli.WriteQuotaAvailable);
+				}
+				OVERLAPPED ovlOverlapped = {};
+				bSuccess = WriteFile(hFile, buf, (DWORD)len,
+						(LPDWORD)&processed, &ovlOverlapped);
+				if (!bSuccess) {
+					DWORD dwError = GetLastError();
+					if (dwError == ERROR_IO_PENDING) {
+						bSuccess = GetOverlappedResult(hFile, &ovlOverlapped,
+								(LPDWORD)&processed, /* bWait */ TRUE);
+						dwError = GetLastError();
+					}
+					if (dwError == ERROR_BROKEN_PIPE ||
+							dwError == ERROR_NO_DATA) {
+						bSuccess = TRUE;
+						processed = 0;
+					}
+				}
+			} else {
+				bSuccess = WriteFile(hFile, buf, (DWORD)len,
+						(LPDWORD)&processed, NULL);
+			}
+			if (!bSuccess) {
+				err = EIO;
+				goto error;
+			}
 #else
 			processed = write(op->fd_entry->fd, buf, len);
 #endif
@@ -2402,7 +2539,8 @@ syscall:
 			OVERLAPPED ovlOverlapped = {};
 			ovlOverlapped.Offset = off & 0xffffffff;
 			ovlOverlapped.OffsetHigh = (off >> 32) & 0xffffffff;
-			WriteFile((HANDLE)op->fd_entry->fd, buf, (DWORD)len, (LPDWORD)&processed, &ovlOverlapped);
+			WriteFile((HANDLE)op->fd_entry->fd, buf, (DWORD)len,
+					(LPDWORD)&processed, &ovlOverlapped);
 #else
 			processed = pwrite(op->fd_entry->fd, buf, len, off);
 #endif
@@ -2486,8 +2624,14 @@ _dispatch_operation_deliver_data(dispatch_operation_t op,
 	if (op->direction == DOP_DIR_READ) {
 		if (op->buf_len) {
 			void *buf = op->buf;
+#if defined(_WIN32)
+			// buf is allocated with _aligned_malloc()
+			data = dispatch_data_create(buf, op->buf_len, NULL,
+					^{ _aligned_free(buf); });
+#else
 			data = dispatch_data_create(buf, op->buf_len, NULL,
 					DISPATCH_DATA_DESTRUCTOR_FREE);
+#endif
 			op->buf = NULL;
 			op->buf_len = 0;
 			dispatch_data_t d = dispatch_data_create_concat(op->data, data);
@@ -2564,6 +2708,7 @@ _dispatch_operation_deliver_data(dispatch_operation_t op,
 #pragma mark -
 #pragma mark dispatch_io_debug
 
+DISPATCH_COLD
 static size_t
 _dispatch_io_debug_attr(dispatch_io_t channel, char* buf, size_t bufsiz)
 {
@@ -2587,7 +2732,7 @@ _dispatch_io_debug(dispatch_io_t channel, char* buf, size_t bufsiz)
 {
 	size_t offset = 0;
 	offset += dsnprintf(&buf[offset], bufsiz - offset, "%s[%p] = { ",
-			dx_kind(channel), channel);
+			_dispatch_object_class_name(channel), channel);
 	offset += _dispatch_object_debug_attr(channel, &buf[offset],
 			bufsiz - offset);
 	offset += _dispatch_io_debug_attr(channel, &buf[offset], bufsiz - offset);
@@ -2595,6 +2740,7 @@ _dispatch_io_debug(dispatch_io_t channel, char* buf, size_t bufsiz)
 	return offset;
 }
 
+DISPATCH_COLD
 static size_t
 _dispatch_operation_debug_attr(dispatch_operation_t op, char* buf,
 		size_t bufsiz)
@@ -2622,7 +2768,7 @@ _dispatch_operation_debug(dispatch_operation_t op, char* buf, size_t bufsiz)
 {
 	size_t offset = 0;
 	offset += dsnprintf(&buf[offset], bufsiz - offset, "%s[%p] = { ",
-			dx_kind(op), op);
+			_dispatch_object_class_name(op), op);
 	offset += _dispatch_object_debug_attr(op, &buf[offset], bufsiz - offset);
 	offset += _dispatch_operation_debug_attr(op, &buf[offset], bufsiz - offset);
 	offset += dsnprintf(&buf[offset], bufsiz - offset, "}");

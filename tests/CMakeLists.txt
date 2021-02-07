@@ -31,11 +31,6 @@ target_include_directories(bsdtests
                            PUBLIC
                              # bsdtests.h needs config_ac.h
                              ${PROJECT_BINARY_DIR})
-if(BSD_OVERLAY_FOUND)
-  target_compile_options(bsdtests
-                         PRIVATE
-                           ${BSD_OVERLAY_CFLAGS})
-endif()
 if (WIN32)
   target_sources(bsdtests
                  PRIVATE
@@ -43,7 +38,11 @@ if (WIN32)
   target_compile_definitions(bsdtests
                              PUBLIC
                                _CRT_NONSTDC_NO_WARNINGS
-                               _CRT_SECURE_NO_WARNINGS)
+                               _CRT_SECURE_NO_WARNINGS
+                               _USE_MATH_DEFINES)
+  target_link_libraries(bsdtests
+                        PUBLIC
+                          bcrypt)
 endif ()
 
 add_executable(bsdtestharness
@@ -54,23 +53,13 @@ target_include_directories(bsdtestharness
                              ${CMAKE_CURRENT_BINARY_DIR}
                              ${CMAKE_CURRENT_SOURCE_DIR}
                              ${PROJECT_SOURCE_DIR})
-if(BSD_OVERLAY_FOUND)
-  target_compile_options(bsdtestharness
-                         PRIVATE
-                           ${BSD_OVERLAY_CFLAGS})
-endif()
 target_link_libraries(bsdtestharness
                       PRIVATE
                         bsdtests
                         dispatch)
-if(BSD_OVERLAY_FOUND)
-  target_link_libraries(bsdtestharness
-                        PRIVATE
-                          ${BSD_OVERLAY_LDFLAGS})
-endif()
 
 function(add_unit_test name)
-  set(options DISABLED_TEST;NO_BSD_OVERLAY)
+  set(options DISABLED_TEST)
   set(single_value_args)
   set(multiple_value_args SOURCES)
   cmake_parse_arguments(AUT "${options}" "${single_value_args}" "${multiple_value_args}" ${ARGN})
@@ -93,11 +82,6 @@ function(add_unit_test name)
   target_include_directories(${name}
                              SYSTEM BEFORE PRIVATE
                                "${BlocksRuntime_INCLUDE_DIR}")
-  if(BSD_OVERLAY_FOUND AND NOT AUT_NO_BSD_OVERLAY)
-    target_compile_options(${name}
-                           PRIVATE
-                             ${BSD_OVERLAY_CFLAGS})
-  endif()
   if("${CMAKE_C_SIMULATE_ID}" STREQUAL "MSVC")
     target_compile_options(${name} PRIVATE -Xclang -fblocks)
     target_compile_options(${name} PRIVATE /W3 -Wno-deprecated-declarations)
@@ -111,11 +95,6 @@ function(add_unit_test name)
                           dispatch
                           Threads::Threads
                           BlocksRuntime::BlocksRuntime)
-  if(BSD_OVERLAY_FOUND AND NOT AUT_NO_BSD_OVERLAY)
-    target_link_libraries(${name}
-                          PRIVATE
-                            ${BSD_OVERLAY_LDFLAGS})
-  endif()
   target_link_libraries(${name} PRIVATE bsdtests)
   add_test(NAME ${name}
            COMMAND bsdtestharness $<TARGET_FILE:${name}>)
@@ -137,7 +116,6 @@ set(DISPATCH_C_TESTS
     api
     debug
     queue_finalizer
-    group
     overcommit
     context_for_key
     after
@@ -148,19 +126,23 @@ set(DISPATCH_C_TESTS
     timer_bit31
     timer_bit63
     timer_set_time
-    starfish
     data
     io_net
+    io_pipe
+    io_pipe_close
     select)
 
 # Tests that usually pass, but occasionally fail.
 # Excluded by default for purposes of Swift CI
 if(EXTENDED_TEST_SUITE)
+  # When dispatch_group is reenabled here, also remove the if(EXTENDED_TEST_SUITE) condition below
   list(APPEND DISPATCH_C_TESTS
        priority
        concur
+       group
        read
        read2
+       starfish
        suspend_timer
        pingpong
        drift
@@ -187,13 +169,23 @@ foreach(test ${DISPATCH_C_TESTS})
                   dispatch_${test}.c)
 endforeach()
 
+set_tests_properties(dispatch_io_pipe PROPERTIES TIMEOUT 15)
+set_tests_properties(dispatch_io_pipe_close PROPERTIES TIMEOUT 5)
+
 # test dispatch API for various C/CXX language variants
-add_unit_test(dispatch_c99 NO_BSD_OVERLAY SOURCES dispatch_c99.c)
+add_unit_test(dispatch_c99 SOURCES dispatch_c99.c)
 add_unit_test(dispatch_plusplus SOURCES dispatch_plusplus.cpp)
 
 # test-specific link options
-target_link_libraries(dispatch_group PRIVATE m)
-target_link_libraries(dispatch_timer_short PRIVATE m)
+if(WIN32)
+  target_link_libraries(dispatch_io_net PRIVATE WS2_32)
+else()
+  # When dispatch_group is reenabled above, remove this
+  if(EXTENDED_TEST_SUITE)
+    target_link_libraries(dispatch_group PRIVATE m)
+  endif()
+  target_link_libraries(dispatch_timer_short PRIVATE m)
+endif()
 
 # test-specific compile options
 set_target_properties(dispatch_c99 PROPERTIES C_STANDARD 99)

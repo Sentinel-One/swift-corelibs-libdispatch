@@ -30,6 +30,24 @@
 #pragma mark -
 #pragma mark _dispatch_wait_until
 
+// _dispatch_wait_until() is used for cases when we're waiting on a thread to
+// finish a critical section that is a few instructions long and cannot fail
+// (IOW has a guarantee of making forward progress).
+//
+// Using _dispatch_wait_until() has two implications:
+// - there's a single waiter for the specified condition,
+// - the thing it is waiting on has a strong guarantee of forward progress
+//   toward resolving the condition.
+//
+// For these reasons, we spin shortly for the likely case when the other thread
+// is on core and we just caught it in the inconsistency window. If the
+// condition we're waiting for doesn't resolve quickly, then we yield because
+// it's very likely the other thread that can unblock us is preempted, and we
+// need to wait for it to be scheduled again.
+//
+// Its typical client is the enqueuer/dequeuer starvation issue for the dispatch
+// enqueue algorithm where there is typically a 1-10 instruction gap between the
+// exchange at the tail and setting the head/prev pointer.
 #if DISPATCH_HW_CONFIG_UP
 #define _dispatch_wait_until(c) ({ \
 		__typeof__(c) _c; \
@@ -40,9 +58,11 @@
 			_dispatch_preemption_yield(_spins); \
 		} \
 		_c; })
-#elif TARGET_OS_EMBEDDED
-// <rdar://problem/15440575>
-#ifndef DISPATCH_WAIT_SPINS
+#else
+#ifndef DISPATCH_WAIT_SPINS_WFE
+#define DISPATCH_WAIT_SPINS_WFE 10
+#endif
+#ifndef DISPATCH_WAIT_SPINS // <rdar://problem/15440575>
 #define DISPATCH_WAIT_SPINS 1024
 #endif
 #define _dispatch_wait_until(c) ({ \
@@ -50,22 +70,17 @@
 		int _spins = -(DISPATCH_WAIT_SPINS); \
 		for (;;) { \
 			if (likely(_c = (c))) break; \
-			if (slowpath(_spins++ >= 0)) { \
+			if (unlikely(_spins++ >= 0)) { \
 				_dispatch_preemption_yield(_spins); \
 			} else { \
 				dispatch_hardware_pause(); \
 			} \
 		} \
 		_c; })
-#else
-#define _dispatch_wait_until(c) ({ \
-		__typeof__(c) _c; \
-		for (;;) { \
-			if (likely(_c = (c))) break; \
-			dispatch_hardware_pause(); \
-		} \
-		_c; })
 #endif
+
+DISPATCH_NOT_TAIL_CALLED DISPATCH_EXPORT
+void *_dispatch_wait_for_enqueuer(void **ptr);
 
 #pragma mark -
 #pragma mark _dispatch_contention_wait_until
@@ -79,22 +94,25 @@
 #ifndef DISPATCH_CONTENTION_SPINS_MIN
 #define DISPATCH_CONTENTION_SPINS_MIN (32 - 1)
 #endif
-#if TARGET_OS_EMBEDDED
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 #define _dispatch_contention_spins() \
 		((DISPATCH_CONTENTION_SPINS_MIN) + ((DISPATCH_CONTENTION_SPINS_MAX) - \
 		(DISPATCH_CONTENTION_SPINS_MIN)) / 2)
 #elif defined(_WIN32)
-#define _dispatch_contention_spins() ({                                        \
-		unsigned int _value;                                           \
-		rand_s(&_value);                                               \
-		(_value & DISPATCH_CONTENTION_SPINS_MAX) | DISPATCH_CONTENTION_SPINS_MIN; })
+// Use randomness to prevent threads from resonating at the same frequency and
+// permanently contending. Windows doesn't provide rand_r(), so use a simple
+// LCG. (msvcrt has rand_s(), but its security guarantees aren't optimal here.)
+#define _dispatch_contention_spins() ({ \
+		static os_atomic(unsigned int) _seed = 1; \
+		unsigned int _next = os_atomic_load(&_seed, relaxed); \
+		os_atomic_store(&_seed, _next * 1103515245 + 12345, relaxed); \
+		((_next >> 24) & (DISPATCH_CONTENTION_SPINS_MAX)) | \
+				(DISPATCH_CONTENTION_SPINS_MIN); })
 #else
 // Use randomness to prevent threads from resonating at the same
-// frequency and permanently contending. All threads sharing the same
-// seed value is safe with the FreeBSD rand_r implementation.
+// frequency and permanently contending.
 #define _dispatch_contention_spins() ({ \
-		static unsigned int _seed; \
-		((unsigned int)rand_r(&_seed) & (DISPATCH_CONTENTION_SPINS_MAX)) | \
+		((unsigned int)rand() & (DISPATCH_CONTENTION_SPINS_MAX)) | \
 				(DISPATCH_CONTENTION_SPINS_MIN); })
 #endif
 #define _dispatch_contention_wait_until(c) ({ \
@@ -102,7 +120,7 @@
 		unsigned int _spins = _dispatch_contention_spins(); \
 		while (_spins--) { \
 			dispatch_hardware_pause(); \
-			if ((_out = fastpath(c))) break; \
+			if (likely(_out = (c))) break; \
 		}; _out; })
 #endif
 
@@ -132,16 +150,26 @@
 		DISPATCH_YIELD_THREAD_SWITCH_OPTION, (mach_msg_timeout_t)(n))
 #define _dispatch_preemption_yield_to(th, n) thread_switch(th, \
 		DISPATCH_YIELD_THREAD_SWITCH_OPTION, (mach_msg_timeout_t)(n))
+#elif HAVE_PTHREAD_YIELD_NP
+#define _dispatch_preemption_yield(n) { (void)n; pthread_yield_np(); }
+#define _dispatch_preemption_yield_to(th, n) { (void)n; pthread_yield_np(); }
+#elif defined(_WIN32)
+#define _dispatch_preemption_yield(n) { (void)n; Sleep(0); }
+#define _dispatch_preemption_yield_to(th, n) { (void)n; Sleep(0); }
 #else
-#define _dispatch_preemption_yield(n) pthread_yield_np()
-#define _dispatch_preemption_yield_to(th, n) pthread_yield_np()
+#define _dispatch_preemption_yield(n) { (void)n; sched_yield(); }
+#define _dispatch_preemption_yield_to(th, n) { (void)n; sched_yield(); }
 #endif // HAVE_MACH
 
 #pragma mark -
 #pragma mark _dispatch_contention_usleep
 
 #ifndef DISPATCH_CONTENTION_USLEEP_START
+#if defined(_WIN32)
+#define DISPATCH_CONTENTION_USLEEP_START 1000   // Must be >= 1ms for Sleep()
+#else
 #define DISPATCH_CONTENTION_USLEEP_START 500
+#endif
 #endif
 #ifndef DISPATCH_CONTENTION_USLEEP_MAX
 #define DISPATCH_CONTENTION_USLEEP_MAX 100000
@@ -157,20 +185,7 @@
 #endif
 #else
 #if defined(_WIN32)
-DISPATCH_INLINE void
-_dispatch_contention_usleep(uint64_t useconds) {
-	static BOOL bQPFExecuted = FALSE;
-	static LARGE_INTEGER liFreq;
-	LARGE_INTEGER liStart, liNow;
-
-	if (!bQPFExecuted)
-		bQPFExecuted = QueryPerformanceFrequency(&liFreq);
-
-	QueryPerformanceCounter(&liStart);
-	do {
-		QueryPerformanceCounter(&liNow);
-	} while ((liNow.QuadPart - liStart.QuadPart) / (float)liFreq.QuadPart * 1000 * 1000 < useconds);
-}
+#define _dispatch_contention_usleep(u) Sleep((u) / 1000)
 #else
 #define _dispatch_contention_usleep(u) usleep((u))
 #endif
