@@ -163,7 +163,7 @@ _dispatch_monotonic_time(void)
 {
 #if HAVE_MACH_ABSOLUTE_TIME
 	return mach_continuous_time();
-#elif defined(__linux__)
+#elif HAVE_DECL_CLOCK_BOOTTIME && defined(__linux__)
 	struct timespec ts;
 	dispatch_assume_zero(clock_gettime(CLOCK_BOOTTIME, &ts));
 	return _dispatch_timespec_to_nano(ts);
