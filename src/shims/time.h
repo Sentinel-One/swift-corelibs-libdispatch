@@ -31,6 +31,10 @@
 #error "Please #include <dispatch/dispatch.h> instead of this file directly."
 #endif
 
+#if !defined(CLOCK_BOOTTIME) && defined(CLOCK_MONOTONIC)
+#define CLOCK_BOOTTIME CLOCK_MONOTONIC
+#endif
+
 #if defined(_WIN32)
 static inline unsigned int
 sleep(unsigned int seconds)
