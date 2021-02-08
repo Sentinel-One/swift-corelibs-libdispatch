@@ -245,6 +245,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL Android)
   set(USE_POSIX_SEM 1)
 endif()
 
+check_symbol_exists(CLOCK_BOOTTIME  "time.h" HAVE_DECL_CLOCK_BOOTTIME)
+
 check_symbol_exists(CLOCK_UPTIME "time.h" HAVE_DECL_CLOCK_UPTIME)
 check_symbol_exists(CLOCK_UPTIME_FAST "time.h" HAVE_DECL_CLOCK_UPTIME_FAST)
 check_symbol_exists(CLOCK_MONOTONIC "time.h" HAVE_DECL_CLOCK_MONOTONIC)
