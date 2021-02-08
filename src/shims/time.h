@@ -31,6 +31,10 @@
 #error "Please #include <dispatch/dispatch.h> instead of this file directly."
 #endif
 
+#if !defined(CLOCK_BOOTTIME) && defined(CLOCK_MONOTONIC)
+#define CLOCK_BOOTTIME CLOCK_MONOTONIC
+#endif
+
 #if defined(_WIN32)
 static inline unsigned int
 sleep(unsigned int seconds)
@@ -163,7 +167,7 @@ _dispatch_monotonic_time(void)
 {
 #if HAVE_MACH_ABSOLUTE_TIME
 	return mach_continuous_time();
-#elif HAVE_DECL_CLOCK_BOOTTIME && defined(__linux__)
+#elif defined(__linux__)
 	struct timespec ts;
 	dispatch_assume_zero(clock_gettime(CLOCK_BOOTTIME, &ts));
 	return _dispatch_timespec_to_nano(ts);
